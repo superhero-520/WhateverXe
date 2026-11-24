@@ -76,6 +76,36 @@ int main() {
         assert(r.status==LinearStatus::Success && dpSourceUnchanged(io,boot,pipe,ddi,0,nullptr,true));
         io.regs[0x60540+0x1000*pipe]^=64;assert(!dpSourceUnchanged(io,boot,pipe,ddi,0,nullptr,true));
     }
+    // Single eDP A is the only Display13 CMTG-secondary source certified.
+    // Keep its PLL and CMTG live during plane setup. Other secondary users,
+    // invalid state, power/mux drift and an external SST caller cannot adopt it.
+    auto secondary=firmware(0,0,4,true);secondary.regs[0x60404]=8;
+    secondary.regs[0x6fa88]=0x80800000;secondary.regs[0x46010]=0xcc000000;
+    auto captured=readDisplay(secondary,true);uint32_t cmtg;
+    assert(value(captured,0x6fa88,cmtg) && cmtg==0x80800000);
+    assert(!dpSource(captured,0,0) && dpSourceUnchanged(secondary,captured,0,0,0,nullptr,true));
+    auto result=reinitializeLinear(secondary,captured,true,0,GOPProtocol::EDP);
+    assert(result.status==LinearStatus::Success);
+    for(auto w:secondary.writes)assert(w.offset!=0x6fa88 && w.offset!=0x60404 && w.offset!=0x46010);
+    for(const auto pair:std::map<uint32_t,uint32_t>{{0x6fa88,0x80000000},{0x60404,24},{0x61404,8},
+         {0x46140,0},{0x164280,1U<<10},{0x46010,0x88000000},{0x64000,0}}) {
+        auto invalid=secondary;invalid.regs[pair.first]=pair.second;
+        assert(!dpSourceUnchanged(invalid,captured,0,0,0,nullptr,true));
+        assert(!dpSource(readDisplay(invalid,true),0,0,nullptr,true));
+    }
+    // The native stop caller has disabled the buffer, pipe and transport.
+    // A state acknowledgement may lag ENABLE, or never arrive. Only the
+    // qualified port's CMTG is changed; a retry can finish the same stop.
+    auto stoppedCMTG=secondary;stoppedCMTG.regs[0x61404]=8;stoppedCMTG.writes.clear();
+    unsigned waits=0;
+    assert(!stopBootCMTG(stoppedCMTG,0,[&]{++waits;}));
+    assert(stoppedCMTG.writes.empty() && waits==0);
+    stoppedCMTG.regs[0x61404]=0;
+    assert(!stopBootCMTG(stoppedCMTG,0,[&]{++waits;}));
+    assert(waits==500 && stoppedCMTG.writes.size()==2 && stoppedCMTG.writes[0].offset==0x60404 &&
+        stoppedCMTG.writes[1].offset==0x6fa88 && stoppedCMTG.regs[0x46010]==0xcc000000);
+    assert(stopBootCMTG(stoppedCMTG,0,[&]{stoppedCMTG.regs[0x6fa88]=0;}));
+    assert(stoppedCMTG.writes.size()==2);
     // Intel TRANS_DDI_BPC: 8/10/6/12 are 0/1/2/3. 4..7 are reserved.
     // This is the link format, independent of the four-byte RGB8 plane.
     for(unsigned depth:{4U,5U,6U,7U}) {

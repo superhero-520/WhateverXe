@@ -5,6 +5,8 @@
 WhateverXeは、WhateverGreenを基に開発した、一部のIntel Xe-LP内蔵GPU向けにAppleのグラフィックスドライバーを適応させるLiluプラグインです。
 [WhateverXe](https://github.com/b00t0x/WhateverXe/releases)と[WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases)は両方とも最新版を使用してください。変更点は[CHANGELOG](CHANGELOG.md)を参照してください。
 
+このフォークでは、内蔵eDPパネルでスケーリングを有効にした状態の起動を検証しています。UltiBook 0.8.5のプレリリースは、ファームウェアの画面表示からmacOSのログイン画面への引き継ぎを対象としています。再起動後の実機確認は今後行います。[フォークのリリース](https://github.com/superhero-520/WhateverXe/releases)
+
 ## 対応範囲
 
 | macOS | 必要バージョン |

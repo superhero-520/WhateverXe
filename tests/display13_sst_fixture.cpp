@@ -5,6 +5,7 @@
 #include <iterator>
 #include <sys/mman.h>
 #include "kern_display13_power_bridge.hpp"
+#include "kern_alderlake_n.hpp"
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_vbt.hpp"
 #include "kern_xelp_sst_program.hpp"
@@ -32,6 +33,7 @@ struct Map {
  }
 };
 struct Context {
+ uint32_t bootCMTGPLL=UINT32_MAX;
  OSObject *firmwareLink=nullptr;
  Display13Power::NativeBridge bridge;void *lock=reinterpret_cast<void *>(1),*controller=nullptr,*access=nullptr;
  Display13Power::MainLinkAUX mainLink[2];alignas(void *) uint8_t powerBytes[0x80]{};void *power=powerBytes;

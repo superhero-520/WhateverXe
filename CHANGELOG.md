@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.5
+
+UltiBook fork prerelease, based on upstream 0.8.4. Pair it with [WhateverXe Graphics 0.4.5](https://github.com/b00t0x/WhateverXe-Graphics/releases/tag/v0.4.5). A visible login after restarting with a scaled desktop and sustained 120 Hz desktop scanout both require hardware verification.
+
+### Tools
+
+- Add an offline tool for generating a macOS display override from the MNE007ZA3-2 panel's advertised 120 Hz timing. The existing HiDPI modes are preserved.
+- Add an offscreen Metal render and readback test for MSL 2.4, 3.0 and 4.0, including direct argument buffer encoding and shader atomic operations.
+
+### Changed
+
+- On Alder Lake and Raptor Lake, preserve a qualified single eDP A firmware timing generator through plane setup. Stop it before releasing its port clock when the first full modeset needs a different panel timing. Based on the [WhateverXe CMTG work](https://github.com/jkbuha/WhateverXe/commit/4a889e01056e6dac4f4fd878813f7b200380216f) and the [i915 CMTG sequence](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_cmtg.c).
+- At the first internal-panel modeset, a compatible trained link can stay active while the native scaler switches to a larger source at the same physical timing.
+
 ## 0.8.4
 
 Update WhateverXe and [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) together.

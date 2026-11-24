@@ -127,6 +127,18 @@ contracts, boundaries or modes change. Report those boundaries, required-mode
 results and limits before aggregate counts, and keep build and hardware claims
 separate from CPU assertions.
 
+For Display13 eDP boot handoff, `display13_linear_dp` covers ownership of a
+single active CMTG secondary, readout drift and bounded stop/retry.
+`display13_boot_handoff` exercises the production scaler decision. The native
+mode also executes the donor surface comparison and pipe-scaler writer with
+modeled MMIO, including a pending 3840×2400 source for a 2880×1800 panel.
+The signed Tahoe payload from WhateverXe Graphics 0.4.4 or 0.4.5 can be
+replayed independently with `--require display13_boot_handoff_release
+--release-donor PATH`. Add `--require display13_boot_resource_release
+--release-accelerator PATH` to replay the associated accelerator path.
+The receiver and framebuffer ownership are fixtures. Register writes in this
+replay do not establish physical scanout after a restart.
+
 ## Selecting and requiring checks
 
 ```sh
@@ -297,3 +309,10 @@ boundary. The existing Display13 PWM branch also makes no AUX calls and preserve
 the modeled sink. `profile_admission` and `framebuffer_common[_native]` separately
 protect Display12 backend selection and installation dispatch; their combination
 is not a full kernel startup replay.
+
+`mne007_refresh_override` runs the offline display override builder with a
+synthetic EDID and a known progressive Type VII timing. It checks the complete
+big-endian IODetailedTimingInformationV2 record, including the pixel clock
+in hertz and both sync polarities, preserves existing display options, and
+rejects incomplete or conflicting source descriptions. WindowServer mode
+enumeration, DisplayPort link training and panel scanout require a live test.

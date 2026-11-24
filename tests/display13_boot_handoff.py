@@ -41,7 +41,8 @@ void IORecursiveLockUnlock(IORecursiveLock *lock) { assert(lock->depth); --lock-
 void *current_thread() { static int thread; return &thread; }
 void IODelay(unsigned us) { assert(us==8); }
 '''+base
-base=base.replace('return regs.at(reg);','return regs[reg];')
+base=base.replace('return regs.at(reg);','return regs[reg];').replace('if(reg==0x45404)v=',
+    'if(reg==0x6fa88 && !(v&(1U<<31)))v&=~(1U<<23);\n  if(reg==0x45404)v=')
 base=base.replace('struct OSObject {','std::map<const void *,unsigned> objectSizes;\nstruct OSObject {').replace(
  'unsigned getClassSize() const{return size;}', 'unsigned getClassSize() const{auto it=objectSizes.find(this);return it==objectSizes.end()?size:it->second;}')
 base=base.replace('struct Context {','''struct Context {
@@ -92,6 +93,7 @@ base=base.replace('struct XE {','''struct XE {
 base=base.replace('// BINDING',fn('static TGLFBBinding::Readout adlnInspectPathBinding('))
 methods='\n'.join(fn(x) for x in ['uint8_t *XE::display13SSTPort(', 'bool XE::display13HDMIPort(', 'bool XE::display13MainLinkAUX(', 'uint32_t XE::wrapDisplay13EnablePort(', 'uint32_t XE::wrapDisplay13DisablePort(', 'uint32_t XE::wrapDisplay13SignalLevels(', 'uint32_t XE::wrapDisplay13TrainingPattern(', 'void XE::wrapAlderLakeNSetupWorkLoop(', 'bool XE::wrapBootModeCompare(', 'bool XE::selectBootMode(', 'void *XE::wrapBootResourceInit(', 'bool XE::display13BootPanelDSCOff(', 'uint32_t XE::wrapDisplay13PortTraining('])
 boundaries='''
+Display13Clock::Variant display13ClockVariant(){return Display13Clock::Variant::ADLP;}
 struct Display13FBBootIO:Display13FBPowerIO {
  bool readable(uint32_t r){return r<0x1000000;}
 };
@@ -136,7 +138,8 @@ std::vector<Stage> lightStages;
 bool replayCleanup=false;
 void *reconstructionPort=nullptr;
 #include "display13_reconstruction_fixture.hpp"
-uint8_t *donor=nullptr,*accelerator=nullptr;
+uint8_t *donor=nullptr,*accelerator=nullptr,*scalerDonor=nullptr;
+bool scaledCase=false;
 uint32_t XE::wrapDisplay13ReadAUX(void*,uint32_t reg,void *out,uint32_t n) {
  assert(!locked);auto bytes=static_cast<uint8_t*>(out);memset(out,0,n);
  AUXCommand command(replayCleanup);
@@ -210,6 +213,10 @@ bool nativeCompare(void *ctl,void *fb,void *path,void *params,const void*t,void*
  if(donor){
   put(donor,0x138c50+0x120,uintptr_t(fault==4));
   return reinterpret_cast<decltype(&nativeCompare)>(donor+0x4f044)(ctl,fb,path,params,t,scaler);
+ }
+ if(scaledCase) { // paramsFbCompare excludes PIPESRC; paramsSurfCompare consumes it later.
+  return memcmp(params,static_cast<uint8_t*>(path)+0x128,0x28) ||
+   memcmp(static_cast<uint8_t*>(params)+0x2c,static_cast<uint8_t*>(path)+0x154,0x1c);
  }
  return fault==4 || memcmp(params,static_cast<uint8_t*>(path)+0x128,0x48);
 }
@@ -291,6 +298,59 @@ void firstMode(Fixture &f,Map &m) {
  if(keep){assert(!memcmp(params,f.path+0x128,sizeof(params)));
   assert(Display13FBMemory::field<uint64_t>(f.fb,0x4358)==270000000);}
  else assert(!memcmp(original,params,sizeof(params)));
+}
+void *scaledPath(unsigned pipe){assert(!pipe);return currentPath;}
+void scaledTrigger(void *path,unsigned reg,unsigned,unsigned command) {
+ assert(path==currentPath && reg==0x7019c && command==0x13);
+}
+void scaledPanel(Fixture &f,Map &m) {
+ auto &c=display13FBPower;auto saved=m.regs;const auto bootPlane=c.firmwarePlane;
+ alignas(8) uint8_t pending[0x58]{},oldScaler[0x20]{},timing[0xa0]{};
+ uint32_t params[0xf0/4]{},savedParams[0xf0/4]{};
+ memcpy(savedParams,f.path+0x128,sizeof(params));
+ put(f.path,0x32c0,pending+0);put(pending,0,0x58U);put(pending,0x10,f.fb+0);put(pending,0x28,f.access+0);
+ put(pending,0x30,0x68180U);put(pending,0x34,0x68170U);put(pending,0x38,0x68174U);
+ put(pending,0x3c,0x60020U);put(pending,0x40,0x68194U);put(pending,0x44,0x80000000U);
+ put(pending,0x4c,(2880U<<16)|1800U);
+ const uint32_t wanted=((3840U-1)<<16)|(2400U-1),live=((2880U-1)<<16)|(1800U-1);
+ const uint32_t timings[]={0xbdf0b3f,0xbdf0b3f,0xb8f0b6f,0x7750707,0x7750707,0x713070d};
+ m.regs[0x6001c]=live;params[10]=wanted;
+ for(unsigned i=0;i<6;++i)params[4+i]=m.regs[0x60000+4*i]=timings[i];
+ // 270 MHz x4 uncompressed link and the same 348.384 MHz panel timing.
+ params[1]=m.regs[0x60400];params[14]=m.regs[0x60040]=0xa528e;params[15]=m.regs[0x60044]=0x80000;
+ params[16]=m.regs[0x60030]=0x7e7bdeaf;params[17]=m.regs[0x60034]=0x800000;
+ put(timing,0x28,uint64_t(348384000));put(timing,0x88,uint16_t(1));put(timing,0x8a,uint16_t(2));
+ state.orgBootModeCompare=reinterpret_cast<uintptr_t>(nativeCompare);scaledCase=true;
+ m.regs[Display13Clock::DSSM]=0x40000000U;m.regs[Display13Clock::Squash]=0;
+ for(unsigned reject=0;reject<11;++reject) {
+  const bool slow=reject==10;m.regs[Display13Clock::PLL]=0xc0000000U+(slow?16:29);
+  m.regs[Display13Clock::Control]=(slow?612:1112);
+  params[10]=reject==6?((5759U<<16)|3599U):wanted;put(pending,0x40,reject==7?0x68294U:0x68194U);
+  put(f.plane,0xb4,reject==9?0x71190U:0x70190U);put(f.plane,0x11c,reject==8?memoryResult.size:(params[10]<<16)|(params[10]>>16));
+  c.firmwareLink=reinterpret_cast<OSObject*>(f.port);
+  put(pending,0x44,reject==1?0U:0x80000000U);put(pending,0x4c,reject==2?0U:(2880U<<16)|1800U);
+  m.regs[0x68280]=reject==3?0x80000000U:0;
+  put(timing,0x28,uint64_t(reject==4?696768000:348384000));
+  put(pending,0x28,reject==5?nullptr:f.access+0);
+  memcpy(f.path+0x128,params,sizeof(params)); // stale desired dimensions despite the live GOP
+  const bool full=XE::selectBootMode(f.ctl,f.fb,f.path,params,timing,oldScaler);
+  assert(full==bool(reject) && bool(c.firmwareLink)==!reject);
+  assert(Display13FBMemory::field<unsigned>(f.path,0x150)==(reject?params[10]:live));
+  assert(params[10]==(reject==6?((5759U<<16)|3599U):wanted));
+  if(!reject && donor) {
+   auto cmp=reinterpret_cast<bool (*)(void*,void*,void*,void*,void*)>(donor+0x4f4c6);
+   assert(!cmp(f.ctl,f.path+0x128,params,f.plane+0x100,f.plane+0x100));
+   memcpy(f.path+0x128,params,sizeof(params));
+   m.regs[0x60020]=m.regs[0x68194]=0;
+   reinterpret_cast<void(*)(void*,void*)>(scalerDonor+0x65fd4)(pending,f.path);
+   assert(m.regs[0x6001c]==wanted && m.regs[0x70190]==((2399U<<16)|3839U));
+   assert(m.regs[0x68180]==0x80000000U && m.regs[0x68174]==((2880U<<16)|1800U));
+   m.regs[0x6001c]=live;m.regs[0x68180]=0;put(f.plane,0x11c,memoryResult.size);
+  }
+ }
+ assert(c.firmwarePlane.status==Display13FBMemory::Status::Unavailable);
+ c.firmwarePlane=bootPlane;c.firmwareLink=reinterpret_cast<OSObject*>(f.port);m.regs=saved;memcpy(f.path+0x128,savedParams,sizeof(params));
+ put(f.path,0x32c0,nullptr);put(f.plane,0x11c,memoryResult.size);scaledCase=false;
 }
 void restartPanel(Fixture &f,Map &map,unsigned ddi) {
  auto &c=display13FBPower;
@@ -409,6 +469,13 @@ int main(int argc,char **argv){
   std::ifstream input(argv[1],std::ios::binary);std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)),{});
   donor=static_cast<uint8_t*>(mmap(nullptr,0x400000,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_ANON|MAP_PRIVATE,-1,0));
   assert(donor!=MAP_FAILED && bytes.size()<0x400000);memcpy(donor,bytes.data(),bytes.size());
+  scalerDonor=static_cast<uint8_t*>(mmap(nullptr,0x400000,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_ANON|MAP_PRIVATE,-1,0));
+  assert(scalerDonor!=MAP_FAILED);memcpy(scalerDonor,bytes.data(),bytes.size());
+  jump(scalerDonor+0x917c4,reinterpret_cast<uintptr_t>(scaledPath));
+  jump(scalerDonor+0x5e344,reinterpret_cast<uintptr_t>(nativeRead));
+  jump(scalerDonor+0x924fc,reinterpret_cast<uintptr_t>(scaledTrigger));
+  jump(scalerDonor+0x38c70,reinterpret_cast<uintptr_t>(replayIgnored));
+  for(auto at:{0x66071U,0x66157U})redirect(scalerDonor,at,0x300000,reinterpret_cast<uintptr_t>(replayIgnored));
   jump(donor+0x30de2,reinterpret_cast<uintptr_t>(noMode));jump(donor+0x4eefc,reinterpret_cast<uintptr_t>(noSDP));
   // Replay the installed LightUpEDP body with the real training wrapper.
   // The separate panel-runtime mode exercises the actual patch installer and PPS wrapper.
@@ -453,6 +520,8 @@ int main(int argc,char **argv){
   map.regs[0x164288]=(2U<<2)|(2U<<6);map.regs[0x6001c]=0x077f0437;
   uint32_t timings[]={0x0897077f,0x0897077f,0x080307d7,0x04640437,0x04640437,0x0440043b};
   for(unsigned i=0;i<6;++i)map.regs[0x60000+4*i]=timings[i];
+  const bool secondary=donor && ddi==0 && fault==1 && mode==0 && !foreign;
+  if(secondary) {map.regs[0x60404]=8;map.regs[0x6fa88]=0x80800000;state.display13ClockOrderReady=true;}
   Display13FBBootIO io{&map};assert(c.bridge.begin(io,ddi,3).status==Display13Power::Status::Complete);
   auto boot=AlderLakeN::readDisplay(io,true);
   assert(AlderLakeN::holdDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],ddi,true).status==Display13Power::Status::Complete);
@@ -474,6 +543,17 @@ int main(int argc,char **argv){
   const bool valid=mode<2&&!foreign;
   assert(c.bridge.bootAdopted==valid && c.bridge.state.faulted==!valid);
   if(valid){
+   if(secondary) {
+    assert(c.bootCMTGPLL==0);
+    state.orgTGLPathLookup=reinterpret_cast<uintptr_t>(+[](void*)->OSObject*{return nullptr;});
+    assert(!XE::display13StopTranscoder(f.port));
+    assert(c.bootCMTGPLL==0 && c.mainLink[0].owner==reinterpret_cast<uintptr_t>(f.port));
+    // A path rebound to pipe B cannot release A's AUX or tear down either clock.
+    state.orgTGLPathLookup=reinterpret_cast<uintptr_t>(firstPath);put(f.path,0x3640,1U);
+    assert(!XE::display13StopTranscoder(f.port));put(f.path,0x3640,0U);
+    assert(c.bootCMTGPLL==0 && map.regs[0x46140]==0x10000000);
+   }
+   if(fault==0 && ddi==0 && mode==0 && stoppedSink==Supported)scaledPanel(f,map);
    assert(c.mainLink[ddi].owner==reinterpret_cast<uintptr_t>(f.port)&&!c.mainLink[ddi].bootPending);
    assert(c.bridge.bootPath==reinterpret_cast<uintptr_t>(f.path)&&objectRefs[f.port]==1);
    if(fault==7){
@@ -493,6 +573,7 @@ int main(int argc,char **argv){
    // the same AUX owner for normal training/enable. Mode0 is not rewritten.
    if(fault!=0 && fault!=8)restartPanel(f,map,ddi);
    else assert(!XE::wrapDisplay13DisablePort(f.port));
+   if(secondary)assert(!map.regs[0x60404] && !map.regs[0x6fa88] && c.bootCMTGPLL==UINT32_MAX);
    assert(!c.mainLink[ddi].owner);
    assert(!objectRefs.count(f.port));assert(!XE::wrapDisplay13EnablePort(f.port));
    assert(!XE::wrapDisplay13DisablePort(f.port));assert(!objectRefs.count(f.port));
@@ -500,28 +581,38 @@ int main(int argc,char **argv){
   } else assert(!c.mainLink[ddi].owner&&!objectRefs.count(f.port));
   assert(!locked);
  }
- if(donor)puts("PASS native eDP modeset error unwind through port and Combo clocks, peer preserved, retry succeeds");
+ if(donor)puts("PASS native eDP modeset error unwind, CMTG stop before PLL release, and scaled PIPESRC/plane/window writes");
  puts("PASS link-loss inputs, non-DSC and unknown sinks, native DSC ownership, fastset and stopped DSC retry; same-address tiling and AUX leases");
 }
 '''
+# The original replay identity and the shipped Tahoe identity are distinct.
+# Both branches verify the actual consumer call sites and use the same replay.
+release=sys.argv[1:2]==['--release']
+if release:
+ if len(sys.argv) not in (3,4):raise SystemExit('expected --release FRAMEBUFFER [ACCELERATOR]')
+ sys.argv.pop(1)
 with tempfile.TemporaryDirectory(prefix='display13-handoff-') as d:
  p=Path(d);(p/'test.cpp').write_text(base+main)
  subprocess.run(['clang++','-std=c++17','-O1','-g',*(['-arch','x86_64'] if len(sys.argv)>1 else ['-fsanitize=address,undefined','-fno-sanitize-recover=all']),'-I'+str(r/'WhateverXe'),'-I'+str(r/'tests'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
  args=[]
  if len(sys.argv)>1:
   donor=Path(sys.argv[1]);data=donor.read_bytes()
-  assert hashlib.sha256(data).hexdigest()=='c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731'
+  expected='115a4616e862228a8c82df6e52ba41ac02b9750f116352ff3575aadcc950888e' if release else 'c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731'
+  assert hashlib.sha256(data).hexdigest()==expected
   def target(at):
    assert data[at]==0xe8
    return at+5+int.from_bytes(data[at+1:at+5],'little',signed=True)
   assert target(0x4fbd1)==0x1f50 and target(0x4fca1)==target(0x50ef2)==0x4f044
   assert data[0x4fca6:0x4fcaa]==bytes.fromhex('84c0743d')
+  assert target(0x4fd24)==0x4f4c6 and target(0x4fe1e)==0x65fd4
+  assert data[0x4f4e3:0x4f4eb]==bytes.fromhex('8b46283b42287527')
   assert target(0x4fd69)==target(0x4fddb)==0x1108
   assert data[0x4fd50:0x4fd55]==data[0x4fda1:0x4fda6]==bytes.fromhex('baf0000000')
   args.append(str(donor))
  if len(sys.argv)>2:
   accel=Path(sys.argv[2]);data=accel.read_bytes()
-  assert hashlib.sha256(data).hexdigest()=='bd1a21f5e622aadabdab6441f6b5c38ed73fa3053c783fdf0fb7e4b309f273d0'
+  expected='6c8ab6cce50b9529679ee4fdf5b1c37d091677d945076f41cb4b7f8196c51449' if release else 'bd1a21f5e622aadabdab6441f6b5c38ed73fa3053c783fdf0fb7e4b309f273d0'
+  assert hashlib.sha256(data).hexdigest()==expected
   assert target(0x7f2dd)==0x7ee9a and data[0x7f34c:0x7f354]==bytes.fromhex('31f6ff90a8090000')
   args.append(str(accel))
  subprocess.run([str(p/'test'),*args],check=True)

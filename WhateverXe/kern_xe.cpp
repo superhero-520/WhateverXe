@@ -4739,6 +4739,7 @@ struct Display13FBPowerContext {
     // firmware link's fastset eligibility. Only a stopped plain-link check
     // consumes it; teardown, unreadable state and native DSC training do not.
     bool bootPanelDSCCheckPending {};
+    uint32_t bootCMTGPLL {UINT32_MAX}; // Qualified PLL until the first stopped eDP modeset.
     Display13FBMemory::Readout firmwarePlane; // Complete only while the original slot is eligible.
     bool bootDP {}; // Board protocol captured with the protected boot reference.
     Display13TC::DPRetainedLink tcDPLink[4];
@@ -5622,7 +5623,11 @@ bool XE::processDisplay13Framebuffer(KernelPatcher &patcher,size_t index,mach_vm
         const char *symbol="__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE";
         const uint8_t call[]={0xe8,0x9e,0xf3,0xff,0xff,0x84,0xc0,0x74,0x3d};
         const auto target=patcher.solveSymbol(index,symbol,address,size);
-        const bool known=size>0x4fcaa && target==address+0x4f044 &&
+        const uint8_t compareSource[]={0x8b,0x46,0x28,0x3b,0x42,0x28,0x75,0x27};
+        const uint8_t programScaler[]={0xe8,0xb1,0x61,0x01,0x00};
+        const bool known=size>0x4fe23 && target==address+0x4f044 &&
+            !memcmp(reinterpret_cast<void *>(address+0x4f4e3),compareSource,sizeof(compareSource)) &&
+            !memcmp(reinterpret_cast<void *>(address+0x4fe1e),programScaler,sizeof(programScaler)) &&
             !memcmp(reinterpret_cast<void *>(address+0x4fca1),call,sizeof(call));
         patcher.clearError();
         KernelPatcher::RouteRequest route(symbol,wrapBootModeCompare,orgBootModeCompare);
@@ -7266,6 +7271,20 @@ bool XE::selectBootMode(void *ctl,void *fb,void *path,void *params,const void *t
         return true;
     }
     const bool source=stream(io,c.displayScratch,ddi,panel,c.clock.refKHz,before);
+    auto pipeScaler=field<OSObject *>(path,0x32c0);
+    const auto wantedSource=field<uint32_t>(params,0x28);
+    const auto scalerClockFits=[&] {
+        const auto clock=Display13Clock::read(io,display13ClockVariant());
+        const uint64_t pixel=field<uint64_t>(timing,0x28);
+        const uint64_t sourceArea=uint64_t((wantedSource>>16)+1)*((wantedSource&0xffff)+1);
+        const uint64_t panelArea=uint64_t((before.timings[0]&0x3fff)+1)*((before.timings[3]&0x3fff)+1);
+        // i915 ilk_pipe_pixel_rate adjusts the clock by the scaler area ratio.
+        return clock.status==Display13Clock::Status::Complete && pixel && pixel<=UINT32_MAX &&
+            pixel*sourceArea<=uint64_t(clock.cdclkKHz)*2000*panelArea;
+    };
+    const bool scalerUpdate=source && panel && ddi<2 && scaler && pipeScaler &&
+        pipeScaler->getMetaClass()->getClassSize()>=0x58 && plane && plane->getMetaClass()->getClassSize()>=0x1c8 &&
+        scaledPanelSource(before,wantedSource,pipeScaler,plane,path,fb,c.access) && scalerClockFits();
     port->retain();
     IOLockUnlock(c.lock);
     Receiver sink{},confirmed{};
@@ -7274,17 +7293,23 @@ bool XE::selectBootMode(void *ctl,void *fb,void *path,void *params,const void *t
     memcpy(proposed,params,sizeof(proposed));
     const auto wanted=proposed[1];
     const bool trained=source && receiver(read,before.lanes(),panel,sink);
-    const bool compatible=trained && normalize(before,sink,timing,proposed);
+    const bool compatible=trained && normalize(before,sink,timing,proposed,scalerUpdate);
     // Preserve native forced-update, color/SDP and scaler decisions.
     const bool partial=compatible && !native(ctl,fb,path,proposed,timing,scaler);
     const bool stable=partial && receiver(read,before.lanes(),panel,confirmed) &&
         sink.symbolKHz==confirmed.symbolKHz && sink.enhanced==confirmed.enhanced && sink.alternateReset==confirmed.alternateReset;
     IOLockLock(c.lock);
     const bool keep=stable && owned() && stream(io,c.displayScratch,ddi,panel,c.clock.refKHz,after) &&
-        !memcmp(&before,&after,sizeof(before));
+        !memcmp(&before,&after,sizeof(before)) && (!scalerUpdate || scalerClockFits());
     if(keep) {
         // hwSetMode copies these params into the path cache in BOTH partial
         // branches. setupClocks recomputes the plan for the next mode.
+        if(scalerUpdate) {
+            // paramsSurfCompare uses the previous path cache at 0x4f4e3.
+            // Publish the live old canvas so even a stale cached request
+            // cannot skip programPipeScaler and its PIPESRC update.
+            memcpy(static_cast<uint8_t *>(path)+0x150,&before.source,sizeof(before.source));
+        }
         memcpy(params,proposed,sizeof(proposed));
         const uint64_t clock=uint64_t(sink.symbolKHz)*1000;
         memcpy(static_cast<uint8_t *>(fb)+0x4358,&clock,sizeof(clock));
@@ -7292,8 +7317,8 @@ bool XE::selectBootMode(void *ctl,void *fb,void *path,void *params,const void *t
         c.firmwareLink=nullptr;
     }
     IOLockUnlock(c.lock);port->release();
-    uint32_t record[]={1,ddi,source,trained,compatible,partial,keep,before.symbolKHz,
-        sink.symbolKHz,before.lanes(),((wanted>>1)&7)+1};
+    uint32_t record[]={2,ddi,source,trained,compatible,partial,keep,before.symbolKHz,
+        sink.symbolKHz,before.lanes(),((wanted>>1)&7)+1,before.control2,before.source,wantedSource,scalerUpdate};
     IORegistryEntry::getRegistryRoot()->setProperty("WEXBootLinkDecision",record,sizeof(record));
     return !keep;
 }
@@ -7819,7 +7844,13 @@ bool XE::display13StopTranscoder(void *port) {
  auto s=callbackXE;auto &c=display13FBPower;
  if(!s->display13ClockOrderReady || !s->orgTGLPathLookup || !c.lock)return false;
  auto path=reinterpret_cast<void *(*)(void *)>(s->orgTGLPathLookup)(port);
- if(!path)return true; // A failed early probe may have no pipe at all.
+ if(!path) {
+  // Failed early probes may lack a path. The adopted CMTG owner's missing
+  // path cannot establish that its timing generator released the PLL.
+  IOLockLock(c.lock);
+  const bool pending=c.bootCMTGPLL!=UINT32_MAX && c.mainLink[0].owner==reinterpret_cast<uintptr_t>(port);
+  IOLockUnlock(c.lock);return !pending;
+ }
  auto object=static_cast<OSObject *>(path);
  if(object->getMetaClass()->getClassSize()<0x3730)return false;
  const auto pipe=Display13FBMemory::field<uint32_t>(path,0x3640);
@@ -7833,6 +7864,12 @@ bool XE::display13StopTranscoder(void *port) {
   ok=buffer!=UINT32_MAX && conf!=UINT32_MAX && func!=UINT32_MAX && tp!=UINT32_MAX && clock!=UINT32_MAX &&
    !(buffer&0x80000000U) && !(conf&0xc0000000U) && !((func|tp)&0x80000000U) &&
    (!(clock&0xf0000000U) || (clock>>28)==ddi+(ddi>=3?3:1)) && (!deferred.pending || deferred.port==port);
+  if(ok && c.bootCMTGPLL!=UINT32_MAX && (ddi==0 || c.mainLink[0].owner==reinterpret_cast<uintptr_t>(port))) {
+   ok=pipe==0 && ddi==0 && (s->adlnOutputWiring.panel&1) && c.mainLink[0].owner==reinterpret_cast<uintptr_t>(port) &&
+      c.bridge.bootPath==reinterpret_cast<uintptr_t>(path) &&
+      AlderLakeN::stopBootCMTG(io,c.bootCMTGPLL,[&]{power.delayUs(100);});
+   if(ok)c.bootCMTGPLL=UINT32_MAX;
+  }
   if(ok) {
    if(!(buffer&0x80U))IODelay(8); // DDI disable: idle or >=8us before clock removal.
    const auto value=deferred.pending?deferred.value:(clock&0x0fffffffU);
@@ -7954,6 +7991,11 @@ uint32_t XE::wrapDisplay13DisablePort(void *port) {
  if(port==c.firmwareLink)c.firmwareLink=nullptr;
  IOLockUnlock(c.lock);
  const auto result=FunctionCast(wrapDisplay13DisablePort,s->orgDisplay13DisablePort)(port);
+ if(result) {
+  IOLockLock(c.lock);
+  const bool pending=c.bootCMTGPLL!=UINT32_MAX && c.mainLink[0].owner==reinterpret_cast<uintptr_t>(port);
+  IOLockUnlock(c.lock);if(pending)return result;
+ }
  if(!result && s->display13ClockOrderReady && !display13StopTranscoder(port))return kIOReturnNotReady;
  const bool released=display13MainLinkAUX(port,false,true);
  return result ? result : released ? 0 : kIOReturnNotReady;
@@ -8838,9 +8880,18 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                         linked=tc.owned(ddi) && tc.linkHeld() && boot.activePipes==1 &&
                             AlderLakeN::dpSourceUnchanged(io,boot,0,ddi,0,&source);
                     } else if(ddi<2) {
-                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
-                        linked=result.status==Display13Power::Status::Complete;
-                        if(linked)port->retain(); // Released only after real buffer stop/idle.
+                        uint32_t cmtg=0;
+                        const bool secondary=AlderLakeN::value(boot,AlderLakeN::CMTGControl,cmtg) &&
+                            cmtg==AlderLakeN::CMTGRunning;
+                        uint32_t mux=0;
+                        if(!secondary || (callbackXE->display13ClockOrderReady && AlderLakeN::value(boot,0x164280,mux))) {
+                            result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
+                            linked=result.status==Display13Power::Status::Complete;
+                            if(linked) {
+                                port->retain(); // Released only after real buffer stop/idle.
+                                if(secondary)c.bootCMTGPLL=mux&3;
+                            }
+                        }
                     }
                 }
                 if(linked) {
@@ -9243,8 +9294,20 @@ bool XE::adlnFreeStoppedPipe(IOService *fb) {
 
 
 uint32_t XE::releaseDisplay13Path(IOService *fb,OSObject *path) {
+    auto &c=display13FBPower;
+    if(c.lock) {
+        IOLockLock(c.lock);
+        const bool pending=path && c.bootCMTGPLL!=UINT32_MAX && c.bridge.bootPath==reinterpret_cast<uintptr_t>(path);
+        auto port=pending ? reinterpret_cast<OSObject *>(c.mainLink[0].owner) : nullptr;
+        if(port)port->retain();
+        IOLockUnlock(c.lock);
+        if(pending) {
+            const bool stopped=port && display13StopTranscoder(port);
+            if(port)port->release();
+            if(!stopped)return kIOReturnNotReady;
+        }
+    }
     if(!Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && !callbackXE->adlnOutputWiring.dsi) {
-        auto &c=display13FBPower;
         if(c.lock) {
             IOLockLock(c.lock);
             if(fb==c.pipe[0].memoryFramebuffer && c.bridge.forgetBootPath(reinterpret_cast<uintptr_t>(path))) {
@@ -9254,7 +9317,6 @@ uint32_t XE::releaseDisplay13Path(IOService *fb,OSObject *path) {
         }
         FunctionCast(wrapAlderLakeNFreePath,callbackXE->orgAlderLakeNFreePath)(fb,path);return 0;
     }
-    auto &c=display13FBPower;
     if(!c.lock || !fb || !path || fb->getMetaClass()->getClassSize()<0x4B90 || path->getMetaClass()->getClassSize()<0x3730) {
         return kIOReturnNotReady;
     }

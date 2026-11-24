@@ -30,8 +30,9 @@ namespace Display13DBUF {
 struct Pipe {IOService *memoryFramebuffer{};uintptr_t publishedScanout{};bool destroyingPath{};
  int powerPath{},memory{},scanout{};uint64_t watermarkClockHz{};unsigned wmPending{};};
 struct Power {int *lock{};IOService *controller{};void *map{};bool memoryFaulted{};
+ uint32_t bootCMTGPLL=UINT32_MAX;struct {uintptr_t owner{};} mainLink[2];
  void *firmwareLink{}; Display13FBMemory::Readout firmwarePlane;
- struct Bridge {unsigned forgotten{};bool forgetBootPath(uintptr_t){++forgotten;return true;}}bridge;
+ struct Bridge {uintptr_t bootPath{};unsigned forgotten{};bool forgetBootPath(uintptr_t){++forgotten;return true;}}bridge;
  Pipe pipe[3];Display13DBUF::State dbuf;}display13FBPower;
 struct {struct Slot{IOService *framebuffer{};void *buffer{};}slot[3];}display13FBSysMem;
 struct {unsigned admittedPipes{};}display13FBIRQ;
@@ -42,6 +43,10 @@ struct XE {
  bool display13FramebufferRequested=true;struct Wiring{unsigned value=0x78,dsi=0;operator unsigned()const{return value;}Wiring &operator=(unsigned v){value=v;return *this;}}adlnOutputWiring;void *adlnPlatform{};
  uintptr_t orgAlderLakeNFreePath{},orgDisplay13FreeResources{},orgDisplay13AllocateResources{};
  bool disposeDSIPath(IOService*,OSObject*);
+ static bool display13StopTranscoder(void *port) {
+  assert(!ownerDepth && reinterpret_cast<uintptr_t>(port)==display13FBPower.mainLink[0].owner);
+  return false; // A still-running adopted generator must keep the boot path.
+ }
  static bool adlnFreeStoppedPipe(IOService*);
  static void wrapAlderLakeNFreePath(IOService*,OSObject*);
  static void drainDisplay13TCMode(unsigned ddi) {
@@ -149,6 +154,13 @@ int main(int argc,char**argv){
    assert(!display13FBPower.pipe[0].memoryFramebuffer&&!(display13FBIRQ.admittedPipes&1));
    assert(XE::wrapDisplay13AllocateResources(fb)&&allocCalls==1);
   }
+ }
+ for(auto wiring:{0U,0x78U}) {
+  failure=0;setup(native);state.adlnOutputWiring=wiring;
+  auto &c=display13FBPower;c.bootCMTGPLL=0;c.bridge.bootPath=reinterpret_cast<uintptr_t>(path);
+  c.mainLink[0].owner=reinterpret_cast<uintptr_t>(peer);
+  assert(XE::releaseDisplay13Path(reinterpret_cast<IOService*>(fb),reinterpret_cast<OSObject*>(path))==kIOReturnNotReady);
+  assert(!c.bridge.forgotten && !pathCalls && !memoryCalls);
  }
  failure=0;setup(native);
  // Unretired peer ownership prevents pool destruction even after this path

@@ -16,6 +16,7 @@ inline bool samePlane(const Display13FBMemory::Readout &boot,const void *plane) 
 struct Stream {
     uint32_t func {}, timings[6] {}, source {}, linkM {}, linkN {}, dataM {}, dataN {};
     uint32_t transport {}, pll {}, mux {}, symbolKHz {}, pipeMisc {};
+    uint32_t control2 {}, scalerControl[2] {};
     unsigned lanes() const { return ((func>>1)&7)+1; }
 };
 
@@ -55,6 +56,8 @@ template<class IO> bool stream(IO &io,AlderLakeN::DisplayReadout &scratch,unsign
     for(unsigned i=0;i<6;++i)
         if(!AlderLakeN::value(scratch,0x60000+4*i,s.timings[i]))return false;
     return AlderLakeN::value(scratch,0x70008,conf) && (conf&0xc0000000)==0xc0000000 &&
+        AlderLakeN::value(scratch,0x60404,s.control2) &&
+        AlderLakeN::value(scratch,0x68180,s.scalerControl[0]) && AlderLakeN::value(scratch,0x68280,s.scalerControl[1]) &&
         AlderLakeN::value(scratch,0x60400,s.func) && AlderLakeN::value(scratch,0x60540,s.transport) &&
         AlderLakeN::value(scratch,0x6001c,s.source) && AlderLakeN::value(scratch,0x60040,s.linkM) &&
         AlderLakeN::value(scratch,0x60044,s.linkN) && AlderLakeN::value(scratch,0x60030,s.dataM) &&
@@ -93,14 +96,38 @@ template<class Read> bool receiver(Read read,unsigned lanes,bool panel,Receiver 
     return true;
 }
 
+// The GOP is driving the unscaled native canvas. setupPipeScaler has staged
+// a pipe-bound scaler covering that same physical panel. The native partial
+// scaler branch programs both its window and the new PIPESRC before arming.
+inline bool scaledPanelSource(const Stream &s,uint32_t wanted,const void *scaler,const void *plane,void *path,void *fb,void *access) {
+    const auto width=(s.timings[0]&0x3fff)+1,height=(s.timings[3]&0x3fff)+1;
+    const auto srcWidth=(wanted>>16)+1,srcHeight=(wanted&0xffff)+1;
+    if(!scaler || !plane || !fb || !access || field<void *>(scaler,0x10)!=fb ||
+       field<void *>(plane,0x68)!=fb || field<void *>(plane,0x70)!=path || field<void *>(plane,0x90)!=access ||
+       field<uint32_t>(plane,0x78)!=0 || field<uint32_t>(plane,0xb4)!=0x70190 ||
+       field<uint32_t>(plane,0x11c)!=((wanted<<16)|(wanted>>16)) ||
+       field<void *>(scaler,0x28)!=access || field<uint32_t>(scaler,0x18)!=0 ||
+       s.source!=(((width-1)<<16)|(height-1)) || srcWidth<=width || srcHeight<=height ||
+       width<8 || height<8 || srcWidth>5120 || srcHeight>8192 || srcWidth*height!=srcHeight*width ||
+       srcWidth>3*width || srcHeight>3*height ||
+       ((s.scalerControl[0]|s.scalerControl[1])&(1U<<31)))return false;
+    const auto control=field<uint32_t>(scaler,0x30),value=field<uint32_t>(scaler,0x44);
+    return (control==0x68180 || control==0x68280) &&
+        field<uint32_t>(scaler,0x34)==control-0x10 && field<uint32_t>(scaler,0x38)==control-0xc &&
+        field<uint32_t>(scaler,0x3c)==0x60020 && field<uint32_t>(scaler,0x40)==control+0x14 &&
+        (value&((1U<<31)|(7U<<25)|(1U<<29)|(1U<<19)))==(1U<<31) &&
+        field<uint32_t>(scaler,0x48)==0 && field<uint32_t>(scaler,0x4c)==((width<<16)|height);
+}
+
 // Convert the donor's candidate into the same stream on the running link.
 // hwRegsNeedUpdate still checks forced modeset, timings, pipe parameters,
 // scaler and SDP/color policy. Publish normalized values only on partial mode.
-inline bool normalize(const Stream &s,const Receiver &sink,const void *timing,uint32_t *params) {
+inline bool normalize(const Stream &s,const Receiver &sink,const void *timing,uint32_t *params,bool scalerUpdate) {
     if(!timing || !params || !sink.symbolKHz || sink.symbolKHz>810000 || sink.lanes!=s.lanes() ||
        s.symbolKHz+1<sink.symbolKHz || sink.symbolKHz+1<s.symbolKHz ||
        (s.lanes()!=1 && s.lanes()!=2 && s.lanes()!=4) || sink.enhanced!=bool(s.transport&(1U<<18)) ||
-       (sink.alternateReset!=bool(s.transport&(1U<<6))) || ((s.func^params[1])&~0x10eU) || memcmp(s.timings,params+4,sizeof(s.timings)) || s.source!=params[10])return false;
+       (sink.alternateReset!=bool(s.transport&(1U<<6))) || ((s.func^params[1])&~0x10eU) ||
+       memcmp(s.timings,params+4,sizeof(s.timings)) || (s.source!=params[10] && !scalerUpdate))return false;
     const auto hz=field<uint64_t>(timing,0x28), low=field<uint64_t>(timing,0x30),high=field<uint64_t>(timing,0x38);
     const auto depth=(s.func>>20)&7;
     if(!hz || hz>UINT32_MAX || high>UINT32_MAX || depth>3 || !s.linkN || !s.dataN ||

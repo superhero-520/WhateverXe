@@ -5,6 +5,8 @@
 WhateverXe is a Lilu plugin, derived from WhateverGreen, that adapts Apple graphics drivers for selected Intel Xe-LP integrated GPUs.
 Use the latest releases of [WhateverXe](https://github.com/b00t0x/WhateverXe/releases) and [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) together. See [CHANGELOG](CHANGELOG.md) for release notes.
 
+This fork tests startup with a scaled desktop on an internal eDP panel. The UltiBook 0.8.5 prerelease targets the transition from firmware scanout to the macOS login screen. Verification on hardware after a restart is pending. [Fork releases](https://github.com/superhero-520/WhateverXe/releases)
+
 ## Compatibility
 
 | macOS | Required version |

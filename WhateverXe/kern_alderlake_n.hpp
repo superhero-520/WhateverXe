@@ -129,6 +129,68 @@ struct DisplayReadout {
     Register registers[160] {};
 };
 
+inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
+    if (r.count > sizeof(r.registers) / sizeof(r.registers[0])) return false;
+    for (uint32_t i=0; i<r.count; ++i)
+        if (r.registers[i].offset==offset) { out=r.registers[i].value; return out!=UINT32_MAX; }
+    return false;
+}
+
+constexpr uint32_t CMTGSecondary = 1U<<3, CMTGControl = 0x6FA88;
+constexpr uint32_t CMTGRunning = (1U<<31)|(1U<<23);
+
+// Display13 requires a modeset to detach a secondary. Caller has stopped the
+// port, transport and transcoder A, and still holds the port clock and well.
+// Never switch off a generator that another powered transcoder still uses.
+template<class IO,class Delay> bool stopBootCMTG(IO &io,uint32_t pll,Delay delay) {
+    const auto power=io.read(0x45404);
+    if(pll>1 || power==UINT32_MAX || !(power&(1U<<10)))return false;
+    if((power&(1U<<12)) && (io.read(0x61404)&CMTGSecondary))return false;
+    const auto mux=io.read(0x164280);
+    if((mux&0x403U)!=pll || (io.read(0x46140)>>28)!=1)return false;
+    const auto clock=io.read(0x46010+4*pll);
+    if(clock==UINT32_MAX || (clock&0xcc000000U)!=0xcc000000U)return false;
+    const auto ctl2=io.read(0x60404),control=io.read(CMTGControl);
+    if((ctl2&~CMTGSecondary) || (control&~CMTGRunning))return false;
+    if(ctl2) {
+        io.write(0x60404,0);
+        if(io.read(0x60404))return false;
+    }
+    if(control&(1U<<31))io.write(CMTGControl,control&~(1U<<31));
+    for(unsigned i=0;i<=500;++i) {
+        const auto state=io.read(CMTGControl);
+        if(!state)return true;
+        if(state!=(1U<<23) || i==500)return false;
+        delay();
+    }
+    return false;
+}
+
+// i915 intel_cmtg_sanitize requires the supplying port PLL to stay on.
+// This read-only path covers the single Combo A SST source. Compare the
+// power, mux, PLL and source on both sides of the CMTG register read.
+template<class IO> bool readRunningCMTG(IO &io,const DisplayReadout &r,uint32_t &control) {
+    uint32_t power,func,secondary,clock,buffer,mux;
+    if(r.activePipes!=1 || !(r.poweredPipes&1) || !value(r,0x45404,power) ||
+       !value(r,0x60400,func) || (func&0xff000000U)!=0x8a000000U ||
+       !value(r,0x60404,secondary) || secondary!=CMTGSecondary ||
+       !value(r,0x46140,clock) || clock>>28!=1 ||
+       !value(r,0x64000,buffer) || !(buffer&(1U<<31)) ||
+       !value(r,0x164280,mux) || (mux&3)>1 || (mux&(1U<<10)))return false;
+    const auto pllReg=0x46010+4*(mux&3);
+    const auto routed=[&] {
+        return io.read(0x45404)==power && io.read(0x164280)==mux &&
+            (!(power&(1U<<12)) || !(io.read(0x61404)&CMTGSecondary)) &&
+            io.read(0x46140)==clock && io.read(0x64000)==buffer &&
+            io.read(0x60400)==func && io.read(0x60404)==secondary;
+    };
+    if(!routed() || !io.readable(pllReg) || !io.readable(CMTGControl))return false;
+    const auto pll=io.read(pllReg);
+    if(pll==UINT32_MAX || (pll&0xcc000000U)!=0xcc000000U)return false;
+    control=io.read(CMTGControl);
+    return control!=UINT32_MAX && routed() && io.read(pllReg)==pll;
+}
+
 // Read only. Check Display 13 PW_A/B/C before pipe-local registers; do not
 // access TGL FIA/TC/Dekel addresses or issue selector/power/MMIO writes.
 template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
@@ -190,6 +252,10 @@ template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
         // Display13 DSC/joiner belongs to the corresponding pipe well.
         add(0x78000 + 0x200 * pipe);add(0x78004 + 0x200 * pipe);
     }
+    uint32_t cmtg=0;
+    if(r.status==ReadoutStatus::Complete && readRunningCMTG(io,r,cmtg) &&
+       r.count<sizeof(r.registers)/sizeof(r.registers[0]))
+        r.registers[r.count++]={CMTGControl,cmtg};
     const auto after = add(0x45404);
     if (r.status == ReadoutStatus::Complete && after != power)
         r.status = ReadoutStatus::PowerChanged;
@@ -200,13 +266,6 @@ template<class IO> DisplayReadout readDisplay(IO &io, bool admitted) {
     DisplayReadout r;
     readDisplay(io,admitted,r);
     return r;
-}
-
-inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
-    if (r.count > sizeof(r.registers) / sizeof(r.registers[0])) return false;
-    for (uint32_t i=0; i<r.count; ++i)
-        if (r.registers[i].offset==offset) { out=r.registers[i].value; return out!=UINT32_MAX; }
-    return false;
 }
 
 // Source-side certificate for an already-running, uncompressed external SST
@@ -232,6 +291,9 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
        !value(boot,0x78004+pipe*0x200,dss2) || !value(boot,0x60030+bank,dm) ||
        !value(boot,0x60034+bank,dn) || !value(boot,0x60040+bank,lm) ||
        !value(boot,0x60044+bank,ln))return false;
+    uint32_t cmtg=0;
+    const bool secondary=panel && pipe==0 && ddi==0 && boot.activePipes==1 &&
+        ctl2==CMTGSecondary && value(boot,CMTGControl,cmtg) && cmtg==CMTGRunning;
     const unsigned lanes=((trans>>1)&7)+1;
     // Linux v6.12 i915_reg.h: SST, normal training, scrambling, no FEC/MST,
     // port sync, HDCP, DSC or joined pipes. Enhanced framing may be on or off.
@@ -240,7 +302,7 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
     return (trans&0xFF000000U)==(0x82000000U|((ddi+1)<<27)) && XELPGeometry::rgbLinkDepth(trans) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && (!ctl2 || secondary) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&
@@ -276,6 +338,9 @@ template<class IO> bool dpSourceUnchanged(IO &io,const DisplayReadout &r,unsigne
         if(reg==Display13Power::AUX)expected|=addedAUXRequest;
         if(io.read(reg)!=expected)return false;
     }
+    uint32_t secondary=0,cmtg=0;
+    if(!value(r,0x60404+bank,secondary))return false;
+    if(secondary==CMTGSecondary)return readRunningCMTG(io,r,cmtg) && cmtg==CMTGRunning;
     return true;
 }
 // The GOP is already driving DP. Keep its physical AUX domain on without

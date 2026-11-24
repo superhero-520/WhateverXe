@@ -16,7 +16,7 @@ import test as runner
 
 class RunnerContract(unittest.TestCase):
     def args(self):
-        return argparse.Namespace(donor=None,accelerator=None,ioaccel=None,kernels={},host=[],hde_source=None,ccs_records=None,outer_source=None,linux_tables=None,pcode_donor=None)
+        return argparse.Namespace(donor=None,accelerator=None,release_donor=None,release_accelerator=None,ioaccel=None,kernels={},host=[],hde_source=None,ccs_records=None,outer_source=None,linux_tables=None,pcode_donor=None)
 
     def test_every_registered_script_exists_and_names_are_unique(self):
         jobs = runner.make_jobs(self.args(),ROOT,Path('unused'))

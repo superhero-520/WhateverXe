@@ -52,8 +52,9 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          python3 tools/package.py --build build/DEBUG --configuration DEBUG --tag "$RELEASE_TAG"
-          python3 tools/package.py --build build/RELEASE --configuration RELEASE --tag "$RELEASE_TAG"
+          version_tag="${RELEASE_TAG#ultibook-}"
+          python3 tools/package.py --build build/DEBUG --configuration DEBUG --tag "$version_tag"
+          python3 tools/package.py --build build/RELEASE --configuration RELEASE --tag "$version_tag"
           cd build/dist
           shasum -a 256 *.zip > SHA256SUMS
       - name: Upload packages
@@ -74,8 +75,11 @@ jobs:
           retention-days: 14
 
   release:
-    name: Create draft release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'b00t0x/WhateverXe'
+    name: Release verified packages
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
+      (github.repository == 'b00t0x/WhateverXe' ||
+       (github.repository == 'superhero-520/WhateverXe' && startsWith(github.ref_name, 'ultibook-v')))
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -99,7 +103,7 @@ jobs:
               --jq 'select(.isDraft == true) | .body' > release-notes.md && test -s release-notes.md; then
             : # Preserve release text explicitly supplied with the draft.
           else
-            python3 tools/release_notes.py "$RELEASE_TAG" > release-notes.md
+            python3 tools/release_notes.py "${RELEASE_TAG#ultibook-}" > release-notes.md
           fi
           cd dist
           sha256sum -c SHA256SUMS
@@ -111,3 +115,6 @@ jobs:
           fi
           gh release edit "$RELEASE_TAG" --notes-file ../release-notes.md
           gh release upload "$RELEASE_TAG" ./*.zip SHA256SUMS --clobber
+          if [[ "$GH_REPO" == "superhero-520/WhateverXe" ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          fi

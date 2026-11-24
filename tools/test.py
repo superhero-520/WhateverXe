@@ -13,6 +13,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_TESTS = """
+mne007_refresh_override
 tgl_aux_observer tgl_aux_parent tgl_ccs
 tgl_gt2_urb framebuffer_training_registration framebuffer_common display13_shared_registration
 profile_admission firmware_readout display13_offline adlp_fb_candidate display13_tc_native
@@ -86,6 +87,12 @@ def make_jobs(args, root, output):
             command.append(str(args.donor))
         label = name if name in {'dsi_apple_timing_native','adls_ddi_power_native'} else name+'_native'
         jobs.append(Job(label, 'binary-check', [('script', command)], ('donor',)))
+    # Signed Tahoe release drivers have distinct full-file identities.
+    for label, inputs in [('display13_boot_handoff_release', ('release_donor',)),
+                          ('display13_boot_resource_release', ('release_donor','release_accelerator'))]:
+        command=[sys.executable,str(root/'tests/display13_boot_handoff.py'),'--release']
+        command.extend(str(getattr(args,key)) for key in inputs if getattr(args,key))
+        jobs.append(Job(label,'binary-check',[('script',command)],inputs))
     for name in ACCELERATOR_TESTS:
         command = [sys.executable,str(root/'tests'/(name+'.py'))]
         if args.accelerator:
@@ -158,6 +165,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--donor',type=Path)
     parser.add_argument('--accelerator',type=Path)
+    parser.add_argument('--release-donor',type=Path,help='signed Tahoe framebuffer from WhateverXe Graphics 0.4.4 or 0.4.5')
+    parser.add_argument('--release-accelerator',type=Path,help='matching signed Tahoe accelerator')
     parser.add_argument('--ioaccel',type=Path,help='exact native IOAcceleratorFamily2 for recovery callback replay')
     parser.add_argument('--kernel',action='append',default=[],metavar='FAMILY=PATH')
     parser.add_argument('--host',action='append',type=Path,default=[])
@@ -178,7 +187,7 @@ def main(argv=None):
         if not separator or family not in FAMILIES or family in args.kernels or not Path(path).is_file():
             parser.error('expected unique supported FAMILY=existing-kernel path')
         args.kernels[family] = Path(path).resolve()
-    for key in ['donor','accelerator','ioaccel','hde_source','ccs_records','outer_source','linux_tables','pcode_donor']:
+    for key in ['donor','accelerator','release_donor','release_accelerator','ioaccel','hde_source','ccs_records','outer_source','linux_tables','pcode_donor']:
         value = getattr(args,key)
         if value:
             if not value.is_file():parser.error('--'+key.replace('_','-')+' requires a file')
